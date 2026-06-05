@@ -1,0 +1,670 @@
+#include <SPI.h>
+#include <SD.h>
+#include <DHT.h>
+#include <WiFiS3.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <time.h>
+
+// ================= WIFI =================
+char ssid[] = "Laptop";
+char pass[] = "12345678";
+WiFiClient client;
+
+// ThingSpeak
+String apiKey = "CQOPNBEUGNGHWEFP";   // Your Write API Key
+char server[] = "api.thingspeak.com";
+
+// ================= NTP =================
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800, 60000);
+
+// ================= DHT11 =================
+#define DHTPIN 2
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// ================= LDR =================
+#define LDR_PIN 4
+
+// ================= SD CARD =================
+const int chipSelect = 10;
+
+// ================= SOIL CALIBRATION =================
+int dryValue = 800;
+int wetValue = 300;
+
+// ======================================================
+// FUNCTIONS
+// ======================================================
+
+int convertToPercent(int value)
+{
+  return constrain(map(value, dryValue, wetValue, 0, 100), 0, 100);
+}
+
+String getMoistureStatus(int moisture)
+{
+  if (moisture <= 15)
+    return "Dry";
+  else if (moisture <= 30)
+    return "Low";
+  else if (moisture <= 60)
+    return "Optimal";
+  else if (moisture <= 80)
+    return "Wet";
+  else
+    return "Saturated";
+}
+
+String getTempStatus(float temp)
+{
+  if (temp < 20)
+    return "Cold";
+  else if (temp <= 30)
+    return "Normal";
+  else
+    return "Hot";
+}
+
+String getHumidityStatus(float hum)
+{
+  if (hum < 30)
+    return "Dry";
+  else if (hum <= 60)
+    return "Comfort";
+  else
+    return "Humid";
+}
+
+String getLightStatus(int lightState)
+{
+  if (lightState == LOW)
+    return "Bright";
+  else
+    return "Dark";
+}
+
+// ======================================================
+// REAL DATE & TIME FROM NTP
+// ======================================================
+
+String getTimestamp()
+{
+  timeClient.update();
+
+  unsigned long epochTime = timeClient.getEpochTime();
+
+  time_t rawTime = epochTime;
+
+  struct tm *timeInfo = localtime(&rawTime);
+
+  char buffer[25];
+
+  sprintf(buffer,
+          "%04d-%02d-%02d %02d:%02d:%02d",
+          timeInfo->tm_year + 1900,
+          timeInfo->tm_mon + 1,
+          timeInfo->tm_mday,
+          timeInfo->tm_hour,
+          timeInfo->tm_min,
+          timeInfo->tm_sec);
+
+  return String(buffer);
+}
+
+// ======================================================
+// WIFI
+// ======================================================
+
+void connectWiFi()
+{
+  Serial.print("Connecting WiFi");
+
+  while (WiFi.begin(ssid, pass) != WL_CONNECTED)
+  {
+    Serial.print(".");
+    delay(2000);
+  }
+
+  Serial.println();
+  Serial.println("WiFi Connected");
+
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  Serial.print("RSSI: ");
+  Serial.println(WiFi.RSSI());
+}
+
+// ======================================================
+// SD CARD FUNCTIONS
+// ======================================================
+
+void writeToSD(String data)
+{
+  File file = SD.open("DATA.CSV", FILE_WRITE);
+
+  if (file)
+  {
+    file.println(data);
+    file.close();
+
+    Serial.println("SD: Data Saved");
+  }
+  else
+  {
+    Serial.println("SD: Write Failed");
+  }
+}
+
+void readCSV()
+{
+  File file = SD.open("DATA.CSV");
+
+  if (file)
+  {
+    Serial.println();
+    Serial.println("===== DATA.CSV CONTENT =====");
+
+    while (file.available())
+    {
+      Serial.write(file.read());
+    }
+
+    file.close();
+
+    Serial.println();
+    Serial.println("===== END OF FILE =====");
+  }
+  else
+  {
+    Serial.println("Unable to open DATA.CSV");
+  }
+}
+
+void showStatus()
+{
+  Serial.println();
+  Serial.println("===== SD CARD STATUS =====");
+
+  if (SD.exists("DATA.CSV"))
+  {
+    File file = SD.open("DATA.CSV");
+
+    if (file)
+    {
+      Serial.print("File Exists : YES\n");
+
+      Serial.print("File Size : ");
+      Serial.print(file.size());
+      Serial.println(" bytes");
+
+      file.close();
+    }
+  }
+  else
+  {
+    Serial.println("File Exists : NO");
+  }
+
+  Serial.println("==========================");
+}
+
+void clearCSV()
+{
+  if (SD.exists("DATA.CSV"))
+  {
+    SD.remove("DATA.CSV");
+    Serial.println("Old DATA.CSV Deleted");
+  }
+
+  File file = SD.open("DATA.CSV", FILE_WRITE);
+
+  if (file)
+  {
+    file.println(
+        "Time,Temp,TempStatus,Humidity,HumidityStatus,Light,"
+        "Plant1,Plant1Status,"
+        "Plant2,Plant2Status,"
+        "Plant3,Plant3Status,"
+        "Plant4,Plant4Status,"
+        "Average,AverageStatus");
+
+    file.close();
+
+    Serial.println("New DATA.CSV Created");
+  }
+  else
+  {
+    Serial.println("Failed To Create DATA.CSV");
+  }
+}
+
+// ======================================================
+// SOIL SENSOR FILTERING
+// ======================================================
+
+int readSoilSensor(byte pin)
+{
+  long sum = 0;
+
+  for (int i = 0; i < 10; i++)
+  {
+    sum += analogRead(pin);
+    delay(5);
+  }
+
+  return sum / 10;
+}
+
+// ======================================================
+// SENSOR HEALTH CHECK
+// ======================================================
+
+String getSensorHealth(int rawValue)
+{
+  if (rawValue <= 5)
+    return "DISCONNECTED";
+
+  if (rawValue >= 1018)
+    return "DISCONNECTED";
+
+  return "OK";
+}
+int getSystemHealth(int raw1, int raw2, int raw3, int raw4)
+{
+  int health = 100;
+
+  if (getSensorHealth(raw1) != "OK")
+    health -= 25;
+
+  if (getSensorHealth(raw2) != "OK")
+    health -= 25;
+
+  if (getSensorHealth(raw3) != "OK")
+    health -= 25;
+
+  if (getSensorHealth(raw4) != "OK")
+    health -= 25;
+
+  return health;
+}
+void sendToThingSpeak(float temp,
+                      float hum,
+                      int lightState,
+                      int p1,
+                      int p2,
+                      int p3,
+                      int p4,
+                      int systemHealth)
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("ThingSpeak: WiFi Not Connected");
+    return;
+  }
+
+  if (client.connect(server, 80))
+  {
+    String url =
+      "/update?api_key=" + apiKey +
+      "&field1=" + String(temp) +
+      "&field2=" + String(hum) +
+      "&field3=" + String(lightState == LOW ? 1 : 0) +
+      "&field4=" + String(p1) +
+      "&field5=" + String(p2) +
+      "&field6=" + String(p3) +
+      "&field7=" + String(p4) +
+      "&field8=" + String(systemHealth);
+
+    client.print(
+      String("GET ") + url +
+      " HTTP/1.1\r\n" +
+      "Host: api.thingspeak.com\r\n" +
+      "Connection: close\r\n\r\n"
+    );
+
+    Serial.println("Uploading To ThingSpeak...");
+
+   unsigned long timeout = millis();
+
+while (client.available() == 0)
+{
+  if (millis() - timeout > 5000)
+  {
+    Serial.println("ThingSpeak Timeout");
+    client.stop();
+    return;
+  }
+}
+
+Serial.println("ThingSpeak Upload Success");
+
+while (client.available())
+{
+  client.read();
+}
+
+client.stop();
+  }
+  else
+  {
+    Serial.println("ThingSpeak Connection Failed");
+  }
+}
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(2000);
+
+  dht.begin();
+  pinMode(LDR_PIN, INPUT);
+
+  // SD CARD INIT
+  if (SD.begin(chipSelect))
+  {
+    Serial.println("SD Card Ready");
+
+    if (!SD.exists("DATA.CSV"))
+    {
+      File file = SD.open("DATA.CSV", FILE_WRITE);
+
+      if (file)
+      {
+        file.println(
+            "Time,Temp,TempStatus,Humidity,HumidityStatus,Light,"
+            "Plant1,Plant1Status,"
+            "Plant2,Plant2Status,"
+            "Plant3,Plant3Status,"
+            "Plant4,Plant4Status,"
+            "Average,AverageStatus");
+
+        file.close();
+      }
+    }
+  }
+  else
+  {
+    Serial.println("SD Card Failed");
+  }
+
+  // WIFI
+  connectWiFi();
+
+  // NTP
+  timeClient.begin();
+
+  while (!timeClient.update())
+  {
+    timeClient.forceUpdate();
+  }
+
+  Serial.println("NTP Time Synced");
+}
+
+// ======================================================
+// LOOP
+// ======================================================
+
+void loop()
+{
+  // SERIAL COMMANDS
+
+  if (Serial.available())
+  {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+
+    if (command == "READ")
+    {
+      readCSV();
+      return;
+    }
+
+    if (command == "STATUS")
+    {
+      showStatus();
+      return;
+    }
+
+    if (command == "CLEAR")
+    {
+      clearCSV();
+      return;
+    }
+  }
+
+  // WIFI AUTO RECONNECT
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("WiFi Lost. Reconnecting...");
+    connectWiFi();
+  }
+
+  // SENSOR READINGS
+
+  float temp = dht.readTemperature();
+  float hum = dht.readHumidity();
+
+  if (isnan(temp) || isnan(hum))
+  {
+    Serial.println("ERROR: DHT11 Read Failed");
+    delay(2000);
+    return;
+  }
+
+  int lightState = digitalRead(LDR_PIN);
+
+ int raw1 = readSoilSensor(A0);
+int raw2 = readSoilSensor(A1);
+int raw3 = readSoilSensor(A2);
+int raw4 = readSoilSensor(A3);
+
+Serial.print("Raw1 = ");
+Serial.println(raw1);
+
+Serial.print("Raw2 = ");
+Serial.println(raw2);
+
+Serial.print("Raw3 = ");
+Serial.println(raw3);
+
+Serial.print("Raw4 = ");
+Serial.println(raw4);
+
+int p1 = convertToPercent(raw1);
+int p2 = convertToPercent(raw2);
+int p3 = convertToPercent(raw3);
+int p4 = convertToPercent(raw4);
+  
+
+  // Average only healthy sensors
+
+  int sum = 0;
+  int count = 0;
+
+  if (getSensorHealth(raw1) == "OK")
+  {
+    sum += p1;
+    count++;
+  }
+
+  if (getSensorHealth(raw2) == "OK")
+  {
+    sum += p2;
+    count++;
+  }
+
+  if (getSensorHealth(raw3) == "OK")
+  {
+    sum += p3;
+    count++;
+  }
+
+  if (getSensorHealth(raw4) == "OK")
+  {
+    sum += p4;
+    count++;
+  }
+
+  int avg = (count > 0) ? sum / count : 0;
+  int systemHealth =
+    getSystemHealth(raw1,
+                    raw2,
+                    raw3,
+                    raw4);
+
+  String currentTime = getTimestamp();
+
+  Serial.println();
+  Serial.println("====================================");
+
+  Serial.print("Time : ");
+  Serial.println(currentTime);
+
+  Serial.print("Temp : ");
+  Serial.print(temp);
+  Serial.print(" C (");
+  Serial.print(getTempStatus(temp));
+  Serial.println(")");
+
+  Serial.print("Hum : ");
+  Serial.print(hum);
+  Serial.print(" % (");
+  Serial.print(getHumidityStatus(hum));
+  Serial.println(")");
+
+  Serial.print("Light : ");
+  Serial.println(getLightStatus(lightState));
+
+  Serial.println("===== SENSOR HEALTH =====");
+
+  Serial.print("Plant1 Sensor : ");
+  Serial.println(getSensorHealth(raw1));
+
+  Serial.print("Plant2 Sensor : ");
+  Serial.println(getSensorHealth(raw2));
+
+  Serial.print("Plant3 Sensor : ");
+  Serial.println(getSensorHealth(raw3));
+
+  Serial.print("Plant4 Sensor : ");
+  Serial.println(getSensorHealth(raw4));
+  Serial.println();
+
+  if (p1 <= 30 && getSensorHealth(raw1) == "OK")
+  {
+    Serial.println("ALERT: Plant1 Needs Water");
+  }
+
+  if (p2 <= 30 && getSensorHealth(raw2) == "OK")
+  {
+    Serial.println("ALERT: Plant2 Needs Water");
+  }
+
+  if (p3 <= 30 && getSensorHealth(raw3) == "OK")
+  {
+    Serial.println("ALERT: Plant3 Needs Water");
+  }
+
+  if (p4 <= 30 && getSensorHealth(raw4) == "OK")
+  {
+    Serial.println("ALERT: Plant4 Needs Water");
+  }
+
+  Serial.println();
+  Serial.println();
+
+  Serial.print("Plant1 : ");
+  Serial.print(p1);
+  Serial.print("% (");
+  Serial.print(getMoistureStatus(p1));
+  Serial.println(")");
+
+  Serial.print("Plant2 : ");
+  Serial.print(p2);
+  Serial.print("% (");
+  Serial.print(getMoistureStatus(p2));
+  Serial.println(")");
+
+  Serial.print("Plant3 : ");
+  Serial.print(p3);
+  Serial.print("% (");
+  Serial.print(getMoistureStatus(p3));
+  Serial.println(")");
+
+  Serial.print("Plant4 : ");
+  Serial.print(p4);
+  Serial.print("% (");
+  Serial.print(getMoistureStatus(p4));
+  Serial.println(")");
+
+  Serial.println();
+
+  Serial.print("Average : ");
+  Serial.print(avg);
+  Serial.print("% (");
+  Serial.print(getMoistureStatus(avg));
+  Serial.println(")");
+
+  Serial.println();
+
+Serial.print("System Health : ");
+Serial.print(systemHealth);
+Serial.println("%");
+
+  if (getSensorHealth(raw1) != "OK")
+  {
+    Serial.println("WARNING: Plant1 Sensor Fault");
+  }
+
+  if (getSensorHealth(raw2) != "OK")
+  {
+    Serial.println("WARNING: Plant2 Sensor Fault");
+  }
+
+  if (getSensorHealth(raw3) != "OK")
+  {
+    Serial.println("WARNING: Plant3 Sensor Fault");
+  }
+
+  if (getSensorHealth(raw4) != "OK")
+  {
+    Serial.println("WARNING: Plant4 Sensor Fault");
+  }
+
+  String csv =
+      currentTime + "," +
+      String(temp) + "," +
+      getTempStatus(temp) + "," +
+      String(hum) + "," +
+      getHumidityStatus(hum) + "," +
+      getLightStatus(lightState) + "," +
+      String(p1) + "," + getMoistureStatus(p1) + "," +
+      String(p2) + "," + getMoistureStatus(p2) + "," +
+      String(p3) + "," + getMoistureStatus(p3) + "," +
+      String(p4) + "," + getMoistureStatus(p4) + "," +
+      String(avg) + "," + getMoistureStatus(avg);
+
+  writeToSD(csv);
+ sendToThingSpeak(
+  temp,
+  hum,
+  lightState,
+  p1,
+  p2,
+  p3,
+  p4,
+  systemHealth
+);
+
+  Serial.println("====================================");
+
+  delay(60000);
+}
